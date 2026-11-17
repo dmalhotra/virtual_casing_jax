@@ -1,6 +1,7 @@
 """High-level exterior magnetic-field wrapper for virtual casing."""
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from typing import Callable, Literal
 
@@ -51,14 +52,17 @@ class ExteriorFieldConfig:
     """Configuration for fixed-schedule exterior-field evaluation."""
 
     digits: int = 8
-    src_nphi: int = 64
-    src_ntheta: int = 64
     levels: tuple[tuple[int, int], ...] | None = None
     chunk_size: int | str = "auto"
     target_chunk_size: int | str = "auto"
     branch: Branch = "internal"
     use_jit_schedule: bool = True
-    validate_orientation: bool = True
+    #: Route targets the closed forms miss through the graded rule of ``B_and_derivatives_accurate_xyz``
+    #: (needs a schedule of two or more levels); ``False`` keeps the schedule alone.
+    near_surface: bool = True
+    #: ``(poloidal, toroidal)`` nodes of the graded rule over the full torus;
+    #: ``None`` takes twice the finest schedule level, and at least 256 x 512.
+    graded_nodes: tuple[int, int] | None = None
     dtype: str = "float64"
 
 
@@ -287,6 +291,221 @@ def _near_surface_taylor_B(plan: NearSurfaceTaylorPlan, point):
     return B_surface + gradB_surface @ (point - surface_point)
 
 
+#: Local node spacing at a graded target, as a fraction of its distance.
+_GRADING = 8.0
+#: The substitution ``u - a sin u`` stays monotone for ``a < 1``.
+_MAX_GRADING = 0.9999
+#: Targets closer than this fraction of the half-extent are continued from it.
+_FLOOR = 1.0e-3
+#: Safety factor on the rule's noise, amplified by the continuation, in the error estimate.
+_SAFETY = 10.0
+#: Fewest nodes of the default rule: resolving a distance does not depend on the data.
+_MIN_NODES = (256, 512)
+
+_ROUTE_FACTOR = 30.0  # closed-form error over the squared level difference, gate cases
+
+
+def _graded_evaluate(series, phis, thetas):
+    """Position, both tangents and the field on the tensor grid ``phis x thetas``.
+
+    Separable: the toroidal phases contract first, then the poloidal ones.
+    """
+    c, c_xy, kp, kp_xy, kt, kt_xy = (series[k] for k in ("coefficients", "xy", "kp", "kp_xy", "kt", "kt_xy"))
+    toroidal = jnp.exp(1j * jnp.outer(phis, kp))
+    poloidal = jnp.exp(1j * jnp.outer(thetas, kt))
+    half = jnp.einsum("pk,klq->plq", toroidal, c)
+    half_phi = jnp.einsum("pk,klq->plq", toroidal * (1j * kp)[None, :], c[..., :3])
+    # B_x + i B_y; the phase of the Cartesian components is already in ``kp_xy``
+    b_xy = jnp.einsum("pl,tl->pt", jnp.einsum("pk,kl->pl", jnp.exp(1j * jnp.outer(phis, kp_xy)), c_xy),
+                      jnp.exp(1j * jnp.outer(thetas, kt_xy)))
+
+    def real_sum(a, b):
+        """``Re sum_l a[p, l, q] b[t, l]`` as two real products: half of a complex one."""
+        return (jnp.einsum("plq,tl->ptq", a.real, b.real)
+                - jnp.einsum("plq,tl->ptq", a.imag, b.imag))
+
+    x = real_sum(half[..., :3], poloidal)
+    x_theta = real_sum(half[..., :3], poloidal * (1j * kt)[None, :])
+    x_phi = real_sum(half_phi, poloidal)
+    B_z = real_sum(half[..., 3:], poloidal)[..., 0]
+    cosine, sine = jnp.cos(phis)[:, None], jnp.sin(phis)[:, None]
+
+    def cartesian(v):
+        return jnp.stack((cosine * v[..., 0] - sine * v[..., 1],
+                          sine * v[..., 0] + cosine * v[..., 1], v[..., 2]), axis=-1)
+
+    turn = jnp.stack((-sine * x[..., 0] - cosine * x[..., 1],
+                      cosine * x[..., 0] - sine * x[..., 1], jnp.zeros_like(x[..., 0])), axis=-1)
+    B = jnp.stack((jnp.real(b_xy), jnp.imag(b_xy), B_z), axis=-1)
+    return cartesian(x), cartesian(x_theta), cartesian(x_phi) + turn, B
+
+
+def _graded_series(gamma, field, nfp):
+    """The boundary and its field as Fourier series over one field period.
+
+    Cylindrical components are periodic over a field period, so the one-period
+    samples interpolate spectrally to any angle of the full torus.  Outward is the side
+    of ``e_theta x e_phi`` that encloses a positive volume.  A dense cloud of
+    the whole torus seeds the nearest-point search.
+    """
+    nphi, ntheta = gamma.shape[1:]
+    phi = jnp.linspace(0.0, 2.0 * jnp.pi / nfp, nphi, endpoint=False)[:, None]
+    cosine, sine = jnp.cos(phi), jnp.sin(phi)
+
+    def cylindrical(v):
+        return jnp.stack((cosine * v[0] + sine * v[1], -sine * v[0] + cosine * v[1], v[2]), axis=-1)
+
+    cyl = cylindrical(field)
+    scale = nphi * ntheta
+    boundary = jnp.fft.fft2(jnp.concatenate((cylindrical(gamma), cyl[..., 2:]), axis=-1), axes=(0, 1)) / scale
+    # B_x + i B_y = e^{i phi} (B_R + i B_phi).  Which toroidal mode a row of its transform stands
+    # for, m or m - n, is a guess about the spectrum, which for a field of no symmetry is centred on
+    # a Cartesian mode and for an axisymmetric one on a cylindrical mode, a mode apart at nfp = 1.
+    # The window ends where the spectrum is smallest.
+    transverse = jnp.fft.fft2(cyl[..., 0] + 1j * cyl[..., 1], axes=(0, 1)) / scale
+    energy = jnp.sum(jnp.abs(transverse) ** 2, axis=1)
+    energy = energy + jnp.roll(energy, 1) + jnp.roll(energy, -1)
+    index = np.arange(nphi)
+    shifts = np.array(sorted(range(-(nphi // 4), nphi // 4 + 1), key=abs))
+    # A spectrum that is zero to rounding (an axisymmetric field) or that has no clearly smallest
+    # window leaves the choice to noise, and a choice that noise makes differs between a point and
+    # its neighbours, so that the derivative of the sampled field is not the limit of its
+    # differences.  Energies below a floor count as equal, and another window must be smaller than
+    # the cylindrical one, the first of ``shifts``, by a factor to be chosen over it.
+    edge = energy[(shifts - nphi // 2) % nphi]
+    edge = jnp.maximum(edge, 1.0e-20 * jnp.sum(energy))
+    best = jnp.argmin(edge)
+    centre = jax.lax.stop_gradient(jnp.asarray(shifts)[jnp.where(edge[best] * 3.0 < edge[0], best, 0)])
+    low = centre - nphi // 2
+    window = low + jnp.mod(index - low, nphi)  # the mode of each row within [centre - n/2, centre + n/2)
+    split = jnp.mod(low, nphi).astype(int)[None] if nphi % 2 == 0 else jnp.zeros(0, int)
+    rows_xy = jnp.concatenate((jnp.asarray(index), split))
+    w_xy = jnp.ones(nphi + split.size).at[split].set(0.5).at[nphi:].set(0.5)
+    k_xy = nfp * jnp.concatenate((window, window[split] + nphi)) + 1
+
+    def modes(n, period=1):
+        """Row picks, weights and wavenumbers, the Nyquist mode split into two halves."""
+        k = np.fft.fftfreq(n, 1.0 / n)
+        pick = np.r_[0:n, np.flatnonzero(k == -n / 2)]
+        return (pick, np.where(np.abs(k[pick]) == n / 2, 0.5, 1.0),
+                period * np.where(np.arange(len(pick)) < n, k[pick], -k[pick]))
+
+    (rows, w_t, k_t), (cols, w_p, k_p) = modes(nphi, nfp), modes(ntheta)
+    series = dict(xy=transverse[rows_xy][:, cols] * (w_xy[:, None] * w_p[None, :]),
+                  kp_xy=k_xy, kt_xy=jnp.asarray(k_p))
+    # real data: the modes of negative poloidal wavenumber are the conjugates of the others
+    positive = k_p >= 0
+    cols, w_p, k_p = cols[positive], w_p[positive] * np.where(k_p[positive] > 0, 2.0, 1.0), k_p[positive]
+    series.update(coefficients=boundary[rows][:, cols] * (w_t[:, None] * w_p[None, :])[..., None],
+                  kp=jnp.asarray(k_t), kt=jnp.asarray(k_p))
+    # the field's spectrum within the top quarter of either direction: what the samples cannot resolve
+    poloidal_edge = np.abs(np.fft.fftfreq(ntheta, 1.0 / ntheta))[None, :] >= 0.375 * ntheta
+    toroidal_edge = np.abs(np.fft.fftfreq(nphi, 1.0 / nphi))[:, None] >= 0.375 * nphi
+    transverse_edge = (jnp.abs(window - centre) >= 0.375 * nphi)[:, None]
+    series["tail"] = jnp.maximum(
+        jnp.max(jnp.where(transverse_edge | poloidal_edge, jnp.abs(transverse), 0.0)),
+        jnp.max(jnp.where(toroidal_edge | poloidal_edge, jnp.abs(boundary[..., 3]), 0.0)))
+    x, e_theta, e_phi, _ = _graded_evaluate(
+        series, phi[:, 0], jnp.linspace(0.0, 2.0 * jnp.pi, ntheta, endpoint=False))
+    series["orientation"] = jax.lax.stop_gradient(jnp.sign(jnp.sum(x * jnp.cross(e_theta, e_phi))))
+    angles = (jnp.linspace(0.0, 2.0 * jnp.pi, 2 * n, endpoint=False) for n in (ntheta, nphi * nfp))
+    cloud_theta, cloud_phi = tuple(angles)
+    cloud = _graded_evaluate(series, cloud_phi, cloud_theta)[0].reshape(-1, 3)
+    grid_phi, grid_theta = jnp.meshgrid(cloud_phi, cloud_theta, indexing="ij")
+    series["cloud"] = jax.lax.stop_gradient(cloud)
+    series["cloud_angles"] = jnp.stack((grid_theta.ravel(), grid_phi.ravel()), axis=1)
+    series["cloud_spacing"] = float(2.0 * np.pi / (2 * ntheta))
+    return series
+
+
+def _graded_point(series, theta, phi):
+    x, e_theta, e_phi, _ = _graded_evaluate(series, jnp.atleast_1d(phi), jnp.atleast_1d(theta))
+    return x[0, 0], e_theta[0, 0], e_phi[0, 0]
+
+
+def _nearest_surface_point(position, cloud, cloud_angles, spacing, point, steps: int = 6):
+    """Angles of the surface point nearest ``point``, for ``position(a, b)``.
+
+    The nearest sample of the ``cloud`` (positions and their angles), then Newton
+    on the squared distance with steps no longer than two cloud ``spacing``s,
+    keeping the best iterate.
+    """
+    start = cloud_angles[jnp.argmin(jnp.sum((cloud - point) ** 2, axis=1))]
+    limit = 2.0 * spacing
+
+    def distance2(angles):
+        return jnp.sum((position(angles[0], angles[1]) - point) ** 2)
+
+    def step(carry, _):
+        angles, best, best_value = carry
+        g, H = jax.grad(distance2)(angles), jax.hessian(distance2)(angles)
+        det = H[0, 0] * H[1, 1] - H[0, 1] * H[1, 0]
+        newton = jnp.array((H[1, 1] * g[0] - H[0, 1] * g[1],
+                            H[0, 0] * g[1] - H[1, 0] * g[0])) / jnp.where(det > 0.0, det, 1.0)
+        move = jnp.where(det > 0.0, newton, g / (jnp.abs(jnp.trace(H)) + 1e-30))
+        move = move * jnp.minimum(1.0, limit / jnp.maximum(jnp.linalg.norm(move), 1e-300))
+        angles = angles - move
+        value = distance2(angles)
+        better = value < best_value
+        return (angles, jnp.where(better, angles, best), jnp.where(better, value, best_value)), None
+
+    return jax.lax.scan(step, (start, start, distance2(start)), None, length=steps)[0][1]
+
+
+def _graded_sources(series, center, distance, nodes):
+    """Quadrature nodes and weighted layer densities graded about ``center``.
+
+    ``theta = theta* + u - a sin u`` (likewise ``phi``) with ``u`` on a uniform
+    periodic grid is entire and periodic, so the trapezoid rule in ``u`` stays
+    spectrally accurate, while the node spacing at the target shrinks to
+    ``(1 - a) h``; ``1 - a`` is chosen to make it ``distance / 8``.  Every
+    second node of an even ``nodes`` is again such a rule, with four times the
+    weights.  Returns ``(n_phi, n_theta)`` grids of positions, weighted sheet
+    currents and weighted charges.
+    """
+    n_theta, n_phi = nodes
+    _, e_theta, e_phi = _graded_point(series, center[0], center[1])
+    h_theta = jnp.linalg.norm(e_theta) * 2.0 * jnp.pi / n_theta
+    h_phi = jnp.linalg.norm(e_phi) * 2.0 * jnp.pi / n_phi
+    a_theta = jnp.clip(1.0 - distance / (_GRADING * h_theta), 0.0, _MAX_GRADING)
+    a_phi = jnp.clip(1.0 - distance / (_GRADING * h_phi), 0.0, _MAX_GRADING)
+    u = 2.0 * jnp.pi * jnp.arange(n_theta) / n_theta
+    v = 2.0 * jnp.pi * jnp.arange(n_phi) / n_phi
+    x, x_theta, x_phi, B = _graded_evaluate(
+        series, center[1] + v - a_phi * jnp.sin(v), center[0] + u - a_theta * jnp.sin(u))
+    weight = (((1.0 - a_phi * jnp.cos(v)) * 2.0 * jnp.pi / n_phi)[:, None]
+              * ((1.0 - a_theta * jnp.cos(u)) * 2.0 * jnp.pi / n_theta)[None, :])
+    area = series["orientation"] * jnp.cross(x_theta, x_phi) * weight[..., None]
+    return x, jnp.cross(area, B), jnp.sum(area * B, axis=-1)
+
+
+def _continue(jets, delta, order, extent, noise, distance):
+    """Taylor-continue ``jets`` (``B`` and its derivatives) by ``delta``, to ``order``.
+
+    Also returns, per derivative, the size of what the series leaves out.  For
+    ``B`` this is its last term; for a derivative whose series has no term to
+    spare, the last term times ``(len(jets) + 1) |delta| / extent`` stands in
+    for the next one, which is not known.  Both bound what the truncation
+    and the data's own error in the highest derivative leave.  A sum off by
+    ``noise`` at ``distance`` from the surface has its derivatives of order two
+    and up off by ``noise / distance**j`` (``_SAFETY`` times, as a bound).
+    """
+    out, left = [], []
+    for j in range(order + 1):
+        total, last = jets[j], jets[j]
+        for k in range(1, len(jets) - j):
+            term = jets[j + k]
+            for _ in range(k):
+                term = term @ delta
+            last = term / math.factorial(k)
+            total = total + last
+        out.append(total)
+        left.append(jnp.max(jnp.abs(last)) * (1.0 if j == 0 else (len(jets) + 1) * jnp.linalg.norm(delta) / extent))
+        if j > 1:
+            left[j] = jnp.maximum(left[j], _SAFETY * noise / distance**j)
+    return tuple(out), left
+
+
 class VirtualCasingExteriorField:
     """JAX-native exterior field from VMEC-surface virtual-casing data.
 
@@ -355,17 +574,20 @@ class VirtualCasingExteriorField:
 
     def B_plasma_on_surface(
         self, *, digits=None, chunk_size=None, quad_nt=None, quad_np=None,
-        precision=None,
+        precision=None, target_chunk_size=None,
     ):
         """Return the internal-current plasma field on the source surface.
 
         This reuses the geometry prepared by the exterior field, avoiding a
         second quadrature setup when boundary diagnostics and off-surface
-        evaluations are needed together.
+        evaluations are needed together. Target chunking defaults to the
+        configured value unless overridden for this call.
         """
         kwargs = {
             "digits": int(self.config.digits if digits is None else digits),
             "chunk_size": self.config.chunk_size if chunk_size is None else chunk_size,
+            "target_chunk_size": (self.config.target_chunk_size
+                                  if target_chunk_size is None else target_chunk_size),
         }
         if quad_nt is not None:
             kwargs["quad_nt"] = int(quad_nt)
@@ -442,6 +664,56 @@ class VirtualCasingExteriorField:
             return self._vc.compute_internal_gradB_offsurf(self.B_total, **kwargs)
         return self._vc.compute_external_gradB_offsurf(self.B_total, **kwargs)
 
+    def _level_fields(self, level=None):
+        """Nodes, unit normal, area element and unit-normal densities of a level.
+
+        Returns ``(nodes, normal, area, charge, current)`` with shapes
+        ``(3, nt, np)``, ``(3, nt, np)``, ``(nt, np)``, ``(nt, np)`` and
+        ``(3, nt, np)``; ``charge = B . n`` and ``current = B x n`` carry no
+        quadrature weight.  The densities are built the way the schedule builds
+        them: the field is recovered pointwise on the base grid and
+        interpolated, and the products are formed on the level with the level's
+        own normal.
+        """
+        from .integrals import _level_densities
+        from .surface_ops import grad2d, resample, surf_normal_area_elem
+
+        level = self.schedule_levels[-1] if level is None else level
+        n_toroidal, n_poloidal = int(level[0]), int(level[1])
+
+        def build():
+            source, charge_base, current_base = self._vc._offsurface_densities(
+                self.B_total, int(self.config.digits))
+            nt0, np0 = int(source.shape[1]), int(source.shape[2])
+            normal_base = surf_normal_area_elem(grad2d(source, nt0, np0), source)[0]
+            nodes = resample(source, nt0, np0, n_toroidal, n_poloidal)
+            normal, area = surf_normal_area_elem(grad2d(nodes, n_toroidal, n_poloidal), nodes)
+            charge, current = _level_densities(
+                charge_base, current_base, normal_base, normal,
+                nt0, np0, n_toroidal, n_poloidal)
+            return tuple(jnp.asarray(a) for a in (nodes, normal, area, charge, current))
+
+        return self._cached((n_toroidal, n_poloidal), build)
+
+    def _cached(self, key, build):
+        """``build()``, remembered unless it holds a tracer, which must not outlive its trace.
+
+        These depend only on the field data and the level; rebuilding them costs
+        about one field evaluation.
+        """
+        def traced(value):
+            return any(isinstance(leaf, jax.core.Tracer) for leaf in jax.tree_util.tree_leaves(value))
+
+        cache = self.__dict__.setdefault("_level_source_cache", {})
+        if key not in cache or traced(cache[key]):
+            with jax.ensure_compile_time_eval():  # concrete even inside a caller's jit
+                value = jax.jit(build)()  # compiled: dispatched eagerly these cost seconds
+            if traced(value):
+                cache.pop(key, None)  # a stale entry from another trace
+                return value
+            cache[key] = value
+        return cache[key]
+
     def level_sources(self, level=None):
         """Quadrature nodes and layer densities of one schedule level.
 
@@ -451,50 +723,15 @@ class VirtualCasingExteriorField:
         :func:`~virtual_casing_jax.derivative_kernels.layer_derivatives`.
 
         ``level`` defaults to the finest of the schedule -- the one the
-        two-level default returns unconditionally.  The densities are built the
-        way the schedule builds them: the field is recovered pointwise on the
-        base grid and interpolated, and the products are formed on the level
-        with the level's own normal, so these nodes reproduce
+        two-level default returns unconditionally.  These nodes reproduce
         :meth:`B_plasma_xyz` rather than approximating it.
         """
-        from .integrals import _level_densities
-        from .surface_ops import grad2d, resample, surf_normal_area_elem
-
-        level = self.schedule_levels[-1] if level is None else level
-        n_toroidal, n_poloidal = int(level[0]), int(level[1])
-        # The sources depend only on B_total and the level, both fixed for a
-        # given field, while rebuilding them costs about one field evaluation --
-        # enough to make a single closed-form call look slower than the nested
-        # derivative it replaces.  Cache them, except under tracing, where
-        # holding a tracer past its trace would be worse than recomputing.
-        key = (n_toroidal, n_poloidal)
-        cached = getattr(self, "_level_source_cache", None)
-        if cached is None:
-            cached = self._level_source_cache = {}
-        traced = isinstance(jnp.asarray(self.B_total), jax.core.Tracer)
-        if not traced and key in cached:
-            return cached[key]
-        source, charge_base, current_base = self._vc._offsurface_densities(
-            self.B_total, int(self.config.digits))
-        nt0, np0 = int(source.shape[1]), int(source.shape[2])
-        normal_base = surf_normal_area_elem(grad2d(source, nt0, np0), source)[0]
-
-        nodes = resample(source, nt0, np0, n_toroidal, n_poloidal)
-        normal, area = surf_normal_area_elem(
-            grad2d(nodes, n_toroidal, n_poloidal), nodes)
-        charge, current = _level_densities(
-            charge_base, current_base, normal_base, normal,
-            nt0, np0, n_toroidal, n_poloidal)
-
+        nodes, _, area, charge, current = self._level_fields(level)
         # the package stores J = B x n; the sheet current is n x B
-        sheet_current = -jnp.asarray(current)
-        weight = jnp.asarray(area).reshape(-1)
-        result = (jnp.asarray(nodes).reshape(3, -1).T,
-                  sheet_current.reshape(3, -1).T * weight[:, None],
-                  jnp.asarray(charge).reshape(-1) * weight)
-        if not traced:
-            cached[key] = result
-        return result
+        weight = area.reshape(-1)
+        return (nodes.reshape(3, -1).T,
+                -current.reshape(3, -1).T * weight[:, None],
+                charge.reshape(-1) * weight)
 
     def B_and_derivatives_xyz(self, xyz, *, order=0, level=None, source_chunk=4096):
         """``B`` and its spatial derivatives at ``xyz``, from the closed forms.
@@ -518,6 +755,169 @@ class VirtualCasingExteriorField:
         leading = jnp.asarray(xyz).shape[:-1]
         return tuple(v.reshape(leading + v.shape[1:]) for v in values)
 
+    def B_and_derivatives_accurate_xyz(
+        self, xyz, *, order=1, tol=1.0e-8, route_order=None, branch: Branch | None = None,
+    ):
+        """``B`` and its derivatives at any distance from the surface, either side.
+
+        Each target goes to the closed forms of :meth:`B_and_derivatives_xyz`
+        when their estimated error is below ``tol`` and otherwise to a rule
+        graded about its own nearest surface point (:meth:`_graded`), evaluated
+        only where needed; the routing is a stop-gradient ``where``, safe under
+        ``jit``.  Errors are scaled, ``L**k max|D**k B - ref| / B*``
+        (``L`` the half-extent of the surface, ``B*`` its RMS field), and the
+        ``k``-th derivative may be off by ``tol * 100**k``.  The closed-form
+        error is estimated as ``30`` times the squared difference between the
+        coarsest and the finest level, which covered every gate case; it does not
+        see the resolution of the field data.  The routing looks at the
+        derivatives up to ``route_order`` (default ``order``); ``route_order=0``
+        makes it that of ``B`` alone, whatever ``order`` is, so that nested
+        derivatives of the order-0 call differentiate the same map.  The result
+        jumps by at most ``tol`` where the routing switches.
+
+        Returns ``(values, estimate)``: the ``order + 1`` arrays and a relative
+        error estimate of ``B`` per target (for a graded one, the change from
+        halving the rule's nodes, the last Taylor term within ``1e-3`` of the
+        surface, or the spectrum of the field data at the edge of what they
+        resolve, whichever is largest).  ``jvp``,
+        ``grad`` and ``jacfwd`` through the targets and the field data agree with
+        the returned derivatives.  A target on the surface returns the outside
+        limit.
+        """
+        branch = self.config.branch if branch is None else branch
+        if branch not in ("internal", "external"):
+            raise ValueError("branch must be 'internal' or 'external'")
+        coarse, fine = self.schedule_levels[0], self.schedule_levels[-1]
+        if coarse == fine:
+            raise ValueError("the error estimate needs a schedule of at least two levels")
+        order = int(order)
+        route = order if route_order is None else int(route_order)
+        points = jnp.asarray(xyz)
+        flat = points.reshape((-1, 3)).astype(self.gamma.dtype)
+        nodes = self.level_sources(fine)[0]
+        reference = jnp.sqrt(jnp.mean(jnp.sum(self.B_total**2, axis=0)))
+        extent = jnp.min(jnp.ptp(nodes, axis=0)) / 2.0
+        # a target on a node would make the closed forms infinite and their
+        # gradient NaN; they are not used there, so move it
+        gap2 = jax.lax.map(lambda x: jnp.min(jnp.sum((nodes - x) ** 2, axis=-1)),
+                           flat, batch_size=64)
+        on_node = gap2 < (1.0e-12 * extent) ** 2
+        safe = jnp.where(on_node[:, None], flat + extent, flat)
+        closed = self.B_and_derivatives_xyz(safe, order=order)
+        rough = self.B_and_derivatives_xyz(safe, order=order, level=coarse)
+        estimates = [_ROUTE_FACTOR * (extent**k * jnp.max(jnp.abs((a - b).reshape(len(flat), -1)), axis=1)
+                                      / reference) ** 2 / 100.0**k
+                     for k, (a, b) in enumerate(zip(closed[:route + 1], rough[:route + 1]))]
+        direct = jnp.max(jnp.stack(estimates), axis=0)
+        # ``not (x <= tol)`` sends a NaN estimate to the graded rule
+        needs = jax.lax.stop_gradient(~(direct <= tol) | on_node)
+        values, graded = self._graded(flat, needs, order, reference, extent)
+        sign = 1.0 if branch == "internal" else -1.0
+        leading = points.shape[:-1]
+        merged = tuple(
+            sign * jnp.where(needs.reshape((-1,) + (1,) * (v.ndim - 1)), v, c).reshape(leading + v.shape[1:])
+            for v, c in zip(values, closed))
+        return merged, jnp.where(needs, graded, direct).reshape(leading)
+
+    def _graded(self, points, active, order, reference, extent):
+        """Graded-rule ``B`` and derivatives to ``order`` at the ``active`` targets, and an estimate.
+
+        Each target gets its own quadrature (see :func:`_graded_sources`) about
+        its nearest surface point, in the Cartesian layer sums of
+        :func:`~virtual_casing_jax.derivative_kernels.layer_derivatives`.  Within
+        ``_FLOOR`` of the surface the rule is evaluated at that distance and the
+        jets are Taylor-continued along the normal, from the same side; the
+        exterior and interior fields are analytic up to the surface, so the
+        outside limit is what a target on it returns.  The estimate is the
+        difference from the same rule on every second node, or the larger of that
+        and the field's spectrum at the edge of what the samples resolve.  Within the
+        floor the derivatives count too, by what their continuation leaves out
+        scaled by ``100**-k``, and orders two and up use twice the nodes.  The
+        grading centre is held fixed under differentiation.
+        """
+        from .derivative_kernels import MAX_DERIVATIVE_ORDER, layer_derivatives
+
+        fine = self.schedule_levels[-1]
+        nodes = self.config.graded_nodes or tuple(
+            max(2 * n, m) for n, m in zip((fine[1], fine[0]), _MIN_NODES))
+        series = self._cached(("series",), lambda: _graded_series(
+            self.gamma, self.B_total, int(self.surface_data.nfp)))
+        floor = _FLOOR * extent
+
+        def locate(x):
+            """Whether the target is within the floor, its grading centre and distance, and its lift."""
+            x = jax.lax.stop_gradient(x)
+            angles = _nearest_surface_point(
+                lambda t, p: _graded_point(series, t, p)[0], series["cloud"],
+                series["cloud_angles"], series["cloud_spacing"], x)
+            foot, e_theta, e_phi = _graded_point(series, angles[0], angles[1])
+            normal = jnp.cross(e_theta, e_phi) * series["orientation"]
+            normal = normal / jnp.linalg.norm(normal)
+            height = (x - foot) @ normal
+            distance = jnp.maximum(jnp.abs(height), floor)
+            # a target on the surface, to rounding, counts as outside
+            side = jnp.where(height < -1.0e-10 * extent, -distance, distance)
+            return jnp.abs(height) < floor, angles, distance, (side - height) * normal
+
+        def rule(n, k, continued):
+            def one(x, angles, distance, lift):
+                moved = x + lift
+                grid, current, charge = _graded_sources(series, angles, distance, n)
+
+                def layer(step, weight, order, at=moved):
+                    return layer_derivatives(
+                        at[None], grid[::step, ::step].reshape(-1, 3),
+                        weight * current[::step, ::step].reshape(-1, 3),
+                        weight * charge[::step, ::step].reshape(-1), order=order)
+
+                jets = tuple(v[0] for v in layer(1, 1.0, k))
+                miss = jnp.max(jnp.abs(jets[0] - layer(2, 4.0, 0)[0][0])) / reference
+                if continued:
+                    start = jets[-1]
+                    jets, left = _continue(jets, -lift, order, extent, miss * reference, distance)
+                    if order > 2:
+                        # the missing fourth derivative along the normal: the third at twice the height
+                        up = (moved - _graded_point(series, angles[0], angles[1])[0]) / distance
+                        far = layer(1, 1.0, 3, moved + distance * up)[3][0]
+                        fix = (-lift @ up) * (far - start) / distance
+                        jets = jets[:3] + (jets[3] + fix,)
+                        left[3] = jnp.maximum(left[3], jnp.max(jnp.abs(fix)) * 5.0 * (jnp.linalg.norm(lift) + distance) / extent)
+                    # the k-th derivative may be off by ``tol * 100**k``, scaled by the extent
+                    miss = jnp.maximum(miss, jnp.max(jnp.stack(
+                        [m * extent**j / 100.0**j for j, m in enumerate(left)])) / reference)
+                return jets, jnp.maximum(miss, series["tail"] / reference)
+
+            return jax.vmap(one)
+
+        def zeros(shapes):
+            return jax.tree_util.tree_map(lambda a: jnp.zeros(a.shape, a.dtype), shapes)
+
+        tier, angles, distance, lift = jax.lax.map(locate, points, batch_size=1024)
+        # active targets first and those within the floor first, so that a chunk shares one rule
+        level = jnp.where(active, 1 + tier, 0)
+        rank = jnp.argsort(-level)
+        batch = min(points.shape[0], 4 if jax.default_backend() == "cpu" else 32)
+        padding = (-points.shape[0]) % batch
+
+        def chunks(a):
+            a = a[rank]
+            return jnp.concatenate((a, jnp.repeat(a[-1:], padding, axis=0))).reshape((-1, batch) + a.shape[1:])
+
+        rules = (lambda *a: zeros(jax.eval_shape(rules[1], *a)),
+                 rule(nodes, order, False),
+                 rule(nodes if order < 2 else tuple(2 * m for m in nodes), MAX_DERIVATIVE_ORDER, True))
+        # rematerialised per chunk: a reverse pass keeps the chunk's inputs, not the layer sums' tapes
+        out = jax.lax.map(
+            jax.checkpoint(lambda c: jax.lax.switch(jnp.max(c[0]), rules, *c[1:])),
+            tuple(chunks(a) for a in (level, points, angles, distance, lift)))
+        return jax.tree_util.tree_map(
+            lambda a: a.reshape((-1,) + a.shape[2:])[:points.shape[0]][jnp.argsort(rank)], out)
+
+    def _routed(self):
+        """Whether ``B_plasma_xyz`` and ``gradB_plasma_xyz`` use the accurate evaluator."""
+        levels = self.schedule_levels
+        return self.config.near_surface and self.config.use_jit_schedule and levels[0] != levels[-1]
+
     def B_plasma_xyz(self, xyz, *, branch: Branch | None = None, return_estimate: bool = False):
         """Return the virtual-casing plasma-current field in Cartesian components.
 
@@ -531,6 +931,10 @@ class VirtualCasingExteriorField:
             raise ValueError("branch must be 'internal' or 'external'")
         xyz_soa, restore = _points_to_soa(xyz)
         xyz_soa = xyz_soa.astype(self.gamma.dtype)
+        if self._routed():
+            (value,), estimate = self.B_and_derivatives_accurate_xyz(
+                xyz_soa.T, order=0, tol=10.0**-self.config.digits, branch=branch)
+            return (restore(value.T), estimate) if return_estimate else restore(value.T)
         if not return_estimate:
             return restore(self._call_vc_B(xyz_soa, branch))
         value, estimate = self._call_vc_B(xyz_soa, branch, return_estimate=True)
@@ -602,6 +1006,10 @@ class VirtualCasingExteriorField:
             raise ValueError("branch must be 'internal' or 'external'")
         xyz_soa, _ = _points_to_soa(xyz)
         xyz_soa = xyz_soa.astype(self.gamma.dtype)
+        if self._routed():
+            gradient = self.B_and_derivatives_accurate_xyz(
+                xyz_soa.T, order=1, tol=10.0**-self.config.digits, branch=branch)[0][1]
+            return _restore_matrix_output(jnp.moveaxis(gradient, 0, -1), xyz)
         return _restore_matrix_output(self._call_vc_gradB(xyz_soa, branch), xyz)
 
     def gradB_xyz(self, xyz):

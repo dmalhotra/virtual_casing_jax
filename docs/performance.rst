@@ -32,13 +32,21 @@ target tile size. When enabled, each tile performs a source scan using
 Singular Correction
 -------------------
 
-The singular correction introduces per-target patch work. For now it is
-implemented in Python with JAX primitives, which is adequate for parity
-tests but not yet optimized. The next step is to batch patches and use
-``vmap``/``scan`` to reduce overhead and enable GPU acceleration.
+The singular correction interpolates and integrates a local surface patch
+for each target.
 
 Rematerialization
 -----------------
+
+Regular direct-sum source scans automatically checkpoint each kernel tile.
+During reverse-mode differentiation, kernel intermediates are recomputed for
+the current tile instead of being retained across all source/target pairs.
+This applies to field, field-gradient and double-layer operators, including
+off-surface evaluation. No user setting is needed; quadrature precision,
+forward accumulation order and support for JVPs and higher derivatives are
+preserved. Source and target chunk sizes still control the working tile size.
+Geometry-dependent precision pilots also use automatic target tiling to bound
+their singular-patch temporaries while keeping the same precision test.
 
 The GradB singular correction supports optional rematerialization via
 ``jax.checkpoint`` to trade recomputation for memory. Use ``remat=True``
@@ -66,6 +74,33 @@ CPU and GPU
 The same JAX code runs on CPU and GPU. GPU acceleration is achieved
 via large batched kernel evaluations. The code avoids Python loops in
 performance-critical paths.
+
+Device defaults and when to change them
+---------------------------------------
+
+A call uses JAX's default device, and JAX's default precision unless ``JAX_ENABLE_X64=1``. ``B_xyz_sharded`` is the only route that uses several devices, and it is opt-in.
+
+.. list-table::
+   :header-rows: 1
+
+   * - Setting
+     - Default
+     - Change it when
+   * - ``B_xyz_sharded(devices=)``
+     - opt-in; all JAX devices
+     - A large target batch on several devices
+   * - ``chunk_size``, ``target_chunk_size``
+     - ``"auto"``
+     - Memory runs out, or the override variables below suit your hardware
+   * - ``JAX_ENABLE_X64=1``
+     - off
+     - Parity checks and high-accuracy work
+   * - ``JAX_PLATFORMS=cpu``
+     - GPU when a CUDA ``jaxlib`` is installed
+     - The GPU is busy
+   * - ``XLA_PYTHON_CLIENT_PREALLOCATE=false``
+     - JAX preallocates most GPU memory
+     - Several processes share one GPU
 
 Tips and Tricks
 ---------------
@@ -151,6 +186,12 @@ overhead and is intentionally not automatic. The convenience method stages
 target coordinates through host memory for correctness on systems without GPU
 peer-to-peer access; use ``B_xyz`` directly inside an existing jitted device
 graph.
+
+``VirtualCasingExteriorField.level_sources`` likewise caches only concrete
+source nodes and layer densities.  A traced source field bypasses the cache,
+and source construction traced by an outer ``jax.jit`` is not written to it.
+Those values stay in the active graph, so source-field gradients remain live
+and a JIT-first call cannot poison later eager calls.
 
 Off-surface Schedule + JIT
 ~~~~~~~~~~~~~~~~~~~~~~~~~~

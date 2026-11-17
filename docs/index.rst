@@ -8,11 +8,13 @@ JAX implementation of the virtual casing principle with high-order singular quad
    :caption: Contents
 
    overview
+   tutorials
    equations
    numerics
    functional
    gradb
    offsurface
+   mirror
    vmec_extender
    exterior_field_api
    differentiability

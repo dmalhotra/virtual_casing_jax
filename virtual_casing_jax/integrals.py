@@ -9,9 +9,15 @@
 #    Author: Dhairya Malhotra
 # Modifications Copyright (C) 2026 the virtual_casing_jax authors
 # SPDX-License-Identifier: Apache-2.0
-"""Boundary integral evaluation (baseline direct-sum)."""
+"""Boundary integral evaluation (baseline direct-sum).
+
+Source scan steps are checkpointed so reverse-mode differentiation recomputes
+kernel intermediates per tile instead of saving them for every source/target
+pair. Forward evaluation and the quadrature/accumulation order are unchanged.
+"""
 from __future__ import annotations
 
+from functools import partial
 from typing import Literal
 
 import jax
@@ -150,6 +156,7 @@ def laplace_fxd_u_eval(
         w_chunks = weights.reshape((n_chunks, chunk_size))
 
     if target_chunk_size is None or target_chunk_size <= 0:
+        @partial(jax.checkpoint, prevent_cse=False)
         def scan_fn(acc, xs):
             Xc, wc = xs
             dx = Xt[:, None, :] - Xc[None, :, :]
@@ -168,6 +175,7 @@ def laplace_fxd_u_eval(
     Xt_chunks = Xt.reshape((n_tchunks, target_chunk_size, 3))
 
     def eval_chunk(Xt_chunk):
+        @partial(jax.checkpoint, prevent_cse=False)
         def scan_fn(acc, xs):
             Xc, wc = xs
             dx = Xt_chunk[:, None, :] - Xc[None, :, :]
@@ -233,6 +241,7 @@ def laplace_fxd2_u_eval(
         W_chunks = weights.reshape((n_chunks, chunk_size))
 
     if target_chunk_size is None or target_chunk_size <= 0:
+        @partial(jax.checkpoint, prevent_cse=False)
         def scan_fn(acc, xs):
             Xc, Wc = xs
             dx = Xt[:, None, :] - Xc[None, :, :]
@@ -251,6 +260,7 @@ def laplace_fxd2_u_eval(
     Xt_chunks = Xt.reshape((n_tchunks, target_chunk_size, 3))
 
     def eval_chunk(Xt_chunk):
+        @partial(jax.checkpoint, prevent_cse=False)
         def scan_fn(acc, xs):
             Xc, Wc = xs
             dx = Xt_chunk[:, None, :] - Xc[None, :, :]
@@ -375,6 +385,7 @@ def biotsavart_fx_u_eval(
         W_chunks = weights.reshape((3, n_chunks, chunk_size)).transpose(1, 2, 0)
 
     if target_chunk_size is None or target_chunk_size <= 0:
+        @partial(jax.checkpoint, prevent_cse=False)
         def scan_fn(acc, xs):
             Xc, Wc = xs
             dx = Xt[:, None, :] - Xc[None, :, :]
@@ -393,6 +404,7 @@ def biotsavart_fx_u_eval(
     Xt_chunks = Xt.reshape((n_tchunks, target_chunk_size, 3))
 
     def eval_chunk(Xt_chunk):
+        @partial(jax.checkpoint, prevent_cse=False)
         def scan_fn(acc, xs):
             Xc, Wc = xs
             dx = Xt_chunk[:, None, :] - Xc[None, :, :]
@@ -463,6 +475,7 @@ def biotsavart_fxd_u_eval(
         W_chunks = weights.reshape((3, n_chunks, chunk_size)).transpose(1, 2, 0)
 
     if target_chunk_size is None or target_chunk_size <= 0:
+        @partial(jax.checkpoint, prevent_cse=False)
         def scan_fn(acc, xs):
             Xc, Wc = xs
             dx = Xt[:, None, :] - Xc[None, :, :]
@@ -481,6 +494,7 @@ def biotsavart_fxd_u_eval(
     Xt_chunks = Xt.reshape((n_tchunks, target_chunk_size, 3))
 
     def eval_chunk(Xt_chunk):
+        @partial(jax.checkpoint, prevent_cse=False)
         def scan_fn(acc, xs):
             Xc, Wc = xs
             dx = Xt_chunk[:, None, :] - Xc[None, :, :]
@@ -553,6 +567,7 @@ def laplace_dx_u_eval(
         W_chunks = weights.reshape((n_chunks, chunk_size))
 
     if target_chunk_size is None or target_chunk_size <= 0:
+        @partial(jax.checkpoint, prevent_cse=False)
         def scan_fn(acc, xs):
             Xc, Nc, Wc = xs
             dx = Xt[:, None, :] - Xc[None, :, :]
@@ -571,6 +586,7 @@ def laplace_dx_u_eval(
     Xt_chunks = Xt.reshape((n_tchunks, target_chunk_size, 3))
 
     def eval_chunk(Xt_chunk):
+        @partial(jax.checkpoint, prevent_cse=False)
         def scan_fn(acc, xs):
             Xc, Nc, Wc = xs
             dx = Xt_chunk[:, None, :] - Xc[None, :, :]
