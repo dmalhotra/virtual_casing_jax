@@ -781,8 +781,9 @@ class VirtualCasingExteriorField:
 
         Returns ``(values, estimate)``: the ``order + 1`` arrays and a relative
         error estimate of ``B`` per target (for a graded one, the change from
-        halving the rule's nodes, the change of the fit within the floor, or the spectrum of the field data at the edge of what they
-        resolve, whichever is largest).  ``jvp``,
+        halving the rule's nodes, the change of the fit within the floor, or the
+        spectrum of the field data at the edge of what they resolve, whichever
+        is largest).  ``jvp``,
         ``grad`` and ``jacfwd`` through the targets and the field data agree with
         the returned derivatives.  A target on the surface returns the outside
         limit.
@@ -832,12 +833,13 @@ class VirtualCasingExteriorField:
         evaluated at three heights above that distance and the jets are fitted by a
         polynomial in the height through those values and their height derivatives,
         along the normal, from the same side; the exterior and interior fields are
-        analytic up to the surface, so the outside limit is what a target on it returns.  The estimate is the
-        difference from the same rule on every second node, or the larger of that
-        and the field's spectrum at the edge of what the samples resolve.  Within the
-        floor the derivatives count too, by what the fit leaves out and the
-        rule's noise it carries, scaled by ``100**-k``, and orders two and up use twice the nodes.  The
-        grading centre is held fixed under differentiation.
+        analytic up to the surface, so the outside limit is what a target on it
+        returns.  The estimate is the difference from the same rule on every
+        second node, or the larger of that and the field's spectrum at the edge
+        of what the samples resolve.  Within the floor the derivatives count too,
+        by what the fit leaves out and the rule's noise it carries, scaled by
+        ``100**-k``, and orders two and up use twice the nodes.  The grading
+        centre is held fixed under differentiation.
         """
         from .derivative_kernels import layer_derivatives
 
